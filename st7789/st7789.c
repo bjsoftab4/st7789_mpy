@@ -38,6 +38,7 @@
 #include "py/runtime.h"
 #include "py/builtin.h"
 #include "py/mphal.h"
+#include "jpeg.inl"
 
 // Fix for MicroPython > 1.21 https://github.com/ricksorensen
 #if MICROPY_VERSION_MAJOR >= 1 && MICROPY_VERSION_MINOR > 21
@@ -524,7 +525,7 @@ static mp_obj_t st7789_ST7789_blit_buffer(size_t n_args, const mp_obj_t *args) {
     DC_HIGH();
     CS_LOW();
 
-    const int buf_size = 256;
+    const int buf_size = 4096; // bjsoftab4
     int limit = MIN(buf_info.len, w * h * 2);
     int chunks = limit / buf_size;
     int rest = limit % buf_size;
@@ -540,6 +541,58 @@ static mp_obj_t st7789_ST7789_blit_buffer(size_t n_args, const mp_obj_t *args) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(st7789_ST7789_blit_buffer_obj, 6, 6, st7789_ST7789_blit_buffer);
+
+// bjsoftab4
+static mp_obj_t st7789_ST7789_blit_bufferx2(size_t n_args, const mp_obj_t *args) {
+    st7789_ST7789_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    mp_buffer_info_t buf_info;
+    mp_get_buffer_raise(args[1], &buf_info, MP_BUFFER_READ);
+    mp_int_t x = mp_obj_get_int(args[2]);
+    mp_int_t y = mp_obj_get_int(args[3]);
+    mp_int_t w = mp_obj_get_int(args[4]);
+    mp_int_t h = mp_obj_get_int(args[5]);
+
+    set_window(self, x, y, MIN(self->width, x + w * 2) - 1, MIN(self->height, y + h * 2) - 1);
+    DC_HIGH();
+    CS_LOW();
+
+    self->work = m_malloc(self->width * 2);
+	int hmax = self->height / 2;
+	int wmax = self->width / 2;
+	uint16_t *src, *dst;
+    for (int ln = 0; ln < h; ln++) {
+        if (ln >= hmax) {
+            break;
+        }
+		src = (uint16_t *)buf_info.buf + w * ln;
+		dst = (uint16_t *)self->work;
+        for (int ro = 0; ro < w; ro++) {
+            if (ro >= wmax) {
+                break;
+            }
+			*dst++ = *src;
+			*dst++ = *src++;
+		}
+        const int buf_size = 4096;    // bjsoftab4
+        int limit = MIN(self->width * 2, w * 2 * 2);
+	    int chunks = limit / buf_size;
+	    int rest = limit % buf_size;
+        for (int j = 0; j < 2; j++) {
+		    int i = 0;
+			const uint8_t *ptr = (const uint8_t *)self->work;
+		    for (; i < chunks; i++) {
+		        write_spi(self->spi_obj, ptr + i * buf_size, buf_size);
+		    }
+		    if (rest) {
+		        write_spi(self->spi_obj, ptr + i * buf_size, rest);
+		    }
+		}
+	}
+    CS_HIGH();
+    m_free(self->work);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(st7789_ST7789_blit_bufferx2_obj, 6, 6, st7789_ST7789_blit_bufferx2);
 
 static mp_obj_t st7789_ST7789_draw(size_t n_args, const mp_obj_t *args) {
     st7789_ST7789_obj_t *self = MP_OBJ_TO_PTR(args[0]);
@@ -2343,6 +2396,283 @@ static mp_obj_t st7789_ST7789_bounding(size_t n_args, const mp_obj_t *args) {
     return mp_obj_new_tuple(4, bounds);
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(st7789_ST7789_bounding_obj, 1, 3, st7789_ST7789_bounding);
+#if 1 // JPEGDEC
+static JPEGIMAGE _jpeg;
+void *JPEGdummy = {readFLASH};
+static int JPEGDraw(JPEGDRAW *pDraw) {
+	st7789_ST7789_obj_t *self = (st7789_ST7789_obj_t *)pDraw->pUser;
+    uint16_t *pBuf1 = pDraw->pPixels;
+	mp_int_t x = pDraw->x;
+    mp_int_t y = pDraw->y;
+    mp_int_t w = pDraw->iWidth;
+    mp_int_t h = pDraw->iHeight;
+ //  	mp_printf(MP_PYTHON_PRINTER, "x,y,w,h%d,%d,%d,%d\n", (int)x, (int)y, (int)w, (int)h);
+ //  	mp_printf(MP_PYTHON_PRINTER, "self->w,h%d,%d\n", (int)self->width, (int)self->height);
+
+    set_window(self, x, y, MIN(self->width, x + w) - 1, MIN(self->height, y + h) - 1);
+    DC_HIGH();
+    CS_LOW();
+
+    int hmax = self->height;
+    int wmax = self->width;
+    const int buf_size = 4096;// bjsoftab4
+    int limit = MIN(wmax - x, w);
+	limit *=  MIN(hmax - y, h);
+	limit *= 2; /* byte per pixel */
+    int chunks = limit / buf_size;
+    int rest = limit % buf_size;
+    int i = 0;
+	const uint8_t *ptr = (const uint8_t *)pBuf1;
+    for (; i < chunks; i++) {
+        write_spi(self->spi_obj, ptr + i * buf_size, buf_size);
+    }
+    if (rest) {
+        write_spi(self->spi_obj, ptr + i * buf_size, rest);
+    }
+    CS_HIGH();
+
+    return 1;
+}
+static volatile long mt_lock;
+static int JPEGDraw_mt(JPEGDRAW *pDraw) {
+//	st7789_ST7789_obj_t *self = (st7789_ST7789_obj_t *)pDraw->pUser;
+	mp_int_t x = pDraw->x;
+    mp_int_t y = pDraw->y;
+    mp_int_t w = pDraw->iWidth;
+//  	mp_printf(MP_PYTHON_PRINTER, "x,y,w,h%d,%d,%d,%d\n", (int)x, (int)y, (int)w, (int)h);
+//  	mp_printf(MP_PYTHON_PRINTER, "self->w,h%d,%d\n", (int)self->width, (int)self->height);
+//	mp_printf(MP_PYTHON_PRINTER, "self(%08x)self->spi_obj(%08x)\n", (int)self, (int)self->spi_obj);
+	short val = x + y * w;
+	int flag = 0;
+    while (mt_lock != val) {
+        if (mt_lock == -1) {
+			mt_lock = val; // try to lock
+			flag = 0;
+			continue;
+		}
+        if (flag == 0) {
+			flag = 1;
+		}
+		// already locked
+	}
+	int rc;
+	rc = JPEGDraw(pDraw);
+    
+	mt_lock = -2;
+    while (mt_lock != -1) {
+		mt_lock = -1;
+	}
+
+    return rc;
+}
+
+static int JPEGDrawx2(JPEGDRAW *pDraw) {
+	st7789_ST7789_obj_t *self = (st7789_ST7789_obj_t *)pDraw->pUser;
+    uint16_t *pBuf1 = pDraw->pPixels;
+	mp_int_t x = pDraw->x;
+    mp_int_t y = pDraw->y;
+    mp_int_t w = pDraw->iWidth;
+    mp_int_t h = pDraw->iHeight;
+    uint16_t *pBuf2 = m_malloc(sizeof(uint16_t) * self->width);
+ //  	mp_printf(MP_PYTHON_PRINTER, "x,y,w,h%d,%d,%d,%d\n", (int)x, (int)y, (int)w, (int)h);
+ //  	mp_printf(MP_PYTHON_PRINTER, "self->w,h%d,%d\n", (int)self->width, (int)self->height);
+
+    mp_int_t x2, y2;
+	x2 = MIN(self->width, x * 2 + w * 2);
+	y2 = MIN(self->height, y * 2 + h * 2);
+    set_window(self, x * 2, y * 2, x2 - 1, y2 - 1);
+    DC_HIGH();
+    CS_LOW();
+
+	int hmax = self->height / 2;
+	int wmax = self->width / 2;
+	hmax = MIN(hmax,  h);
+	wmax = MIN(wmax,  w);
+	uint16_t *src, *dst;
+    for (int ln = 0; ln < hmax; ln++) {
+		src = (uint16_t *)pBuf1 + w * ln;
+		dst = (uint16_t *)pBuf2;
+        for (int ro = 0; ro < wmax; ro++) {
+			*dst++ = *src;
+			*dst++ = *src++;
+		}
+	    const int buf_size = 4096;
+		int limit = wmax * 2 * 2;	// width * 2(pixel) * 2(uint16)
+	    int chunks = limit / buf_size;
+	    int rest = limit % buf_size;
+        for (int j = 0; j < 2; j++) {
+		    int i = 0;
+			const uint8_t *ptr = (const uint8_t *)pBuf2;
+		    for (; i < chunks; i++) {
+		        write_spi(self->spi_obj, ptr + i * buf_size, buf_size);
+		    }
+		    if (rest) {
+		        write_spi(self->spi_obj, ptr + i * buf_size, rest);
+		    }
+		}
+	}
+    CS_HIGH();
+	m_free(pBuf2);
+    return 1;
+}
+
+static void jpgdec_init(st7789_ST7789_obj_t *self, JPEGIMAGE *pJpeg, int iDataSize, uint8_t *pData, JPEG_DRAW_CALLBACK func) {
+    memset((void *)pJpeg, 0, sizeof(JPEGIMAGE));
+    pJpeg->ucMemType = JPEG_MEM_RAM;
+    pJpeg->pfnRead = readRAM;
+    pJpeg->pfnSeek = seekMem;
+    pJpeg->pfnDraw = func;
+    pJpeg->pfnOpen = NULL;
+    pJpeg->pfnClose = NULL;
+	pJpeg->pUser = self;
+//   	mp_printf(MP_PYTHON_PRINTER, "pJpeg->pUser(%08x)\n", (int)self);
+    pJpeg->iError = 1111;
+    pJpeg->JPEGFile.iSize = iDataSize;
+    pJpeg->JPEGFile.pData = pData;
+	pJpeg->ucPixelType = RGB565_BIG_ENDIAN;
+
+    pJpeg->iMaxMCUs = 1000; // set to an unnaturally high value to start
+//    result = JPEGInit(pJpeg);
+}
+
+static mp_obj_t st7789_ST7789_jpgdec_decodex2(size_t n_args, const mp_obj_t *args) {
+    st7789_ST7789_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+
+    int result;
+    mp_buffer_info_t inbuf;
+
+    mp_get_buffer_raise(args[1], &inbuf, MP_BUFFER_READ);
+    int iDataSize = inbuf.len;
+    uint8_t *pData = (uint8_t *)inbuf.buf;
+
+    int xoffset = 0, yoffset = 0;
+    if (n_args >= 3) {
+        mp_obj_t o = args[2];
+        if (mp_obj_is_type(o, &mp_type_tuple)) {
+            mp_obj_t *tuple_data = NULL;
+            size_t tuple_len = 0;
+            mp_obj_tuple_get(o, &tuple_len, &tuple_data);
+            if (tuple_len >= 2) {
+               xoffset = mp_obj_get_int(tuple_data[0]);
+               yoffset = mp_obj_get_int(tuple_data[1]);
+            }
+        }
+    }
+	jpgdec_init(self, &_jpeg, iDataSize, pData, JPEGDrawx2);
+    result = JPEGInit(&_jpeg);
+    if (result == 1) {
+	    _jpeg.iXOffset = xoffset;
+	    _jpeg.iYOffset = yoffset;
+	    _jpeg.iOptions = 0;
+	    _jpeg.ucPixelType = RGB565_BIG_ENDIAN;
+		JPEG_setCropArea(&_jpeg, 0, 0, self->width / 2, self->height / 2);
+		result = DecodeJPEG(&_jpeg);
+	}
+        mp_obj_t res[3] = {
+            mp_obj_new_int(result),
+            mp_obj_new_int(_jpeg.iWidth),
+            mp_obj_new_int(_jpeg.iHeight)
+        };
+
+        return mp_obj_new_tuple(3, res);
+    // if( result == 0) result = _jpeg.iError;
+    // return mp_obj_new_int(result);
+
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(st7789_ST7789_jpgdec_decodex2_obj, 2, 3, st7789_ST7789_jpgdec_decodex2);
+
+static mp_obj_t st7789_ST7789_jpgdec_decode(size_t n_args, const mp_obj_t *args) {
+    st7789_ST7789_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+
+    int result;
+    mp_buffer_info_t inbuf;
+
+    mp_get_buffer_raise(args[1], &inbuf, MP_BUFFER_READ);
+    int iDataSize = inbuf.len;
+    uint8_t *pData = (uint8_t *)inbuf.buf;
+    
+    int xoffset = 0, yoffset = 0;
+    if (n_args >= 3) {
+        mp_obj_t o = args[2];
+        if (mp_obj_is_type(o, &mp_type_tuple)) {
+            mp_obj_t *tuple_data = NULL;
+            size_t tuple_len = 0;
+            mp_obj_tuple_get(o, &tuple_len, &tuple_data);
+            if (tuple_len >= 2) {
+               xoffset = mp_obj_get_int(tuple_data[0]);
+               yoffset = mp_obj_get_int(tuple_data[1]);
+            }
+        }
+    }
+
+	jpgdec_init(self, &_jpeg, iDataSize, pData, JPEGDraw);
+    result = JPEGInit(&_jpeg);
+    if (result == 1) {
+	    _jpeg.iXOffset = xoffset;
+	    _jpeg.iYOffset = yoffset;
+	    _jpeg.iOptions = 0;
+	    _jpeg.ucPixelType = RGB565_BIG_ENDIAN;
+	    result = DecodeJPEG(&_jpeg);
+	}
+        mp_obj_t res[3] = {
+            mp_obj_new_int(result),
+            mp_obj_new_int(_jpeg.iWidth),
+            mp_obj_new_int(_jpeg.iHeight)
+        };
+
+        return mp_obj_new_tuple(3, res);
+    // if( result == 0) result = _jpeg.iError;
+    // return mp_obj_new_int(result);
+
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(st7789_ST7789_jpgdec_decode_obj, 2, 3, st7789_ST7789_jpgdec_decode);
+
+static mp_obj_t st7789_ST7789_jpgdec_decode_mt(size_t n_args, const mp_obj_t *args) {
+    st7789_ST7789_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+	JPEGIMAGE *pInfo;
+	pInfo = (JPEGIMAGE *)m_malloc(sizeof(JPEGIMAGE));
+	
+    int x = mp_obj_get_int(args[1]);
+    int y = mp_obj_get_int(args[2]);
+    int w = mp_obj_get_int(args[3]);
+    int h = mp_obj_get_int(args[4]);
+    int result;
+	
+	memcpy(pInfo, &_jpeg, sizeof(JPEGIMAGE));
+	JPEG_setCropArea(pInfo, 0, 0, w, h);
+	pInfo->pfnDraw = JPEGDraw_mt;
+	pInfo->pUser = self;
+    pInfo->iXOffset = x;
+    pInfo->iYOffset = y;
+    result = DecodeJPEG(pInfo);
+	m_free(pInfo);
+	return mp_obj_new_int(result);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(st7789_ST7789_jpgdec_decode_mt_obj, 5, 5, st7789_ST7789_jpgdec_decode_mt);
+
+
+
+static mp_obj_t st7789_ST7789_jpgdec_init(size_t n_args, const mp_obj_t *args) {
+    st7789_ST7789_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+	int result;
+
+    mp_buffer_info_t inbuf;
+    mp_get_buffer_raise(args[1], &inbuf, MP_BUFFER_READ);
+    int iDataSize = inbuf.len;
+    uint8_t *pData = (uint8_t *)inbuf.buf;
+	mt_lock = -1;
+	jpgdec_init(self, &_jpeg, iDataSize, pData, JPEGDraw);
+	result = JPEGInit(&_jpeg);
+    mp_obj_t res[3] = {
+        mp_obj_new_int(result),
+        mp_obj_new_int(_jpeg.iWidth),
+        mp_obj_new_int(_jpeg.iHeight)
+    };
+    return mp_obj_new_tuple(3, res);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(st7789_ST7789_jpgdec_init_obj, 2, 2, st7789_ST7789_jpgdec_init);
+
+#endif
 
 static const mp_rom_map_elem_t st7789_ST7789_locals_dict_table[] = {
     {MP_ROM_QSTR(MP_QSTR_write), MP_ROM_PTR(&st7789_ST7789_write_obj)},
@@ -2358,6 +2688,7 @@ static const mp_rom_map_elem_t st7789_ST7789_locals_dict_table[] = {
     {MP_ROM_QSTR(MP_QSTR_pixel), MP_ROM_PTR(&st7789_ST7789_pixel_obj)},
     {MP_ROM_QSTR(MP_QSTR_line), MP_ROM_PTR(&st7789_ST7789_line_obj)},
     {MP_ROM_QSTR(MP_QSTR_blit_buffer), MP_ROM_PTR(&st7789_ST7789_blit_buffer_obj)},
+    {MP_ROM_QSTR(MP_QSTR_blit_bufferx2), MP_ROM_PTR(&st7789_ST7789_blit_bufferx2_obj)},
     {MP_ROM_QSTR(MP_QSTR_draw), MP_ROM_PTR(&st7789_ST7789_draw_obj)},
     {MP_ROM_QSTR(MP_QSTR_draw_len), MP_ROM_PTR(&st7789_ST7789_draw_len_obj)},
     {MP_ROM_QSTR(MP_QSTR_bitmap), MP_ROM_PTR(&st7789_ST7789_bitmap_obj)},
@@ -2379,6 +2710,10 @@ static const mp_rom_map_elem_t st7789_ST7789_locals_dict_table[] = {
     {MP_ROM_QSTR(MP_QSTR_offset), MP_ROM_PTR(&st7789_ST7789_offset_obj)},
     {MP_ROM_QSTR(MP_QSTR_jpg), MP_ROM_PTR(&st7789_ST7789_jpg_obj)},
     {MP_ROM_QSTR(MP_QSTR_jpg_decode), MP_ROM_PTR(&st7789_ST7789_jpg_decode_obj)},
+    {MP_ROM_QSTR(MP_QSTR_jpgdec_init), MP_ROM_PTR(&st7789_ST7789_jpgdec_init_obj)},
+    {MP_ROM_QSTR(MP_QSTR_jpgdec_decode_mt), MP_ROM_PTR(&st7789_ST7789_jpgdec_decode_mt_obj)},
+    {MP_ROM_QSTR(MP_QSTR_jpgdec_decode), MP_ROM_PTR(&st7789_ST7789_jpgdec_decode_obj)},
+    {MP_ROM_QSTR(MP_QSTR_jpgdec_decodex2), MP_ROM_PTR(&st7789_ST7789_jpgdec_decodex2_obj)},
     {MP_ROM_QSTR(MP_QSTR_png), MP_ROM_PTR(&st7789_ST7789_png_obj)},
     {MP_ROM_QSTR(MP_QSTR_polygon_center), MP_ROM_PTR(&st7789_ST7789_polygon_center_obj)},
     {MP_ROM_QSTR(MP_QSTR_polygon), MP_ROM_PTR(&st7789_ST7789_polygon_obj)},
