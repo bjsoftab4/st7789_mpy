@@ -2,7 +2,7 @@
 # ST7789 Driver for MicroPython   with  bitbank2/JPEGDEC
 
 This driver is based on [(https://github.com/russhughes/st7789_mpy)] and [(https://github.com/bitbank2/JPEGDEC)]\
-I merged these drivers.
+I merged these drivers.  I tested only RP2350.
 
 
 # Original README.md   of  russhughes's ST7789 Driver for MicroPython
